@@ -54,6 +54,8 @@ if __name__ == "__main__":
     parser.add_argument("--magic_prime", default=0, type=int)
     parser.add_argument("--my_testing", default='x070', type=str)
     parser.add_argument("--my_exit_tokens", default=0, type=int)
+    parser.add_argument("--train_type", default="rwkv", type=str)
+    parser.add_argument("--fla_dir", default="./fla", type=str)
 
     parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args()
@@ -104,7 +106,7 @@ if __name__ == "__main__":
     args.epoch_steps = 40320 // args.real_bsz
     assert args.epoch_steps * args.real_bsz == 40320
 
-    if args.train_stage >= 2:  # find latest saved model
+    if args.train_stage >= 2 and not args.train_type == "fla":  # find latest saved model
         list_p = []
         for p in os.listdir(args.proj_dir):
             if p.startswith("rwkv") and p.endswith(".pth"):
@@ -126,6 +128,10 @@ if __name__ == "__main__":
             if args.warmup_steps < 0:
                 args.warmup_steps = 10
         args.epoch_begin = max_p + 1
+    elif args.train_type == "fla":
+        args.epoch_begin = 0
+        args.warmup_steps = 10
+
 
     samples_per_epoch = args.epoch_steps * args.real_bsz
     tokens_per_epoch = samples_per_epoch * args.ctx_len
@@ -200,40 +206,52 @@ if __name__ == "__main__":
     train_data = MyDataset(args)
     args.vocab_size = train_data.vocab_size
 
-    from src.model import RWKV
-    model = RWKV(args)
 
-    if len(args.load_model) == 0 or args.train_stage == 1:  # shall we build the initial weights?
-        init_weight_name = f"{args.proj_dir}/rwkv-init.pth"
-        generate_init_weight(model, init_weight_name)  # save initial weights
-        args.load_model = init_weight_name
+    if args.train_type == "rwkv":
+        from src.model import RWKV
+        model = RWKV(args)
 
-    rank_zero_info(f"########## Loading {args.load_model}... ##########")
-    try:
-        load_dict = torch.load(args.load_model, map_location="cpu", weights_only=True, mmap=True)
-        load_keys = list(load_dict.keys())
-        for k in load_keys:
-            if k.startswith('_forward_module.'):
-                load_dict[k.replace('_forward_module.','')] = load_dict[k]
-                del load_dict[k]
-    except:
-        rank_zero_info(f"Bad checkpoint {args.load_model}")
-        if args.train_stage >= 2:  # try again using another checkpoint
-            max_p = args.my_pile_prev_p
-            if max_p == -1:
-                args.load_model = f"{args.proj_dir}/rwkv-init.pth"
-            else:
-                args.load_model = f"{args.proj_dir}/rwkv-{max_p}.pth"
-            args.epoch_begin = max_p + 1
-            rank_zero_info(f"Trying {args.load_model}")
+        if len(args.load_model) == 0 or args.train_stage == 1:  # shall we build the initial weights?
+            init_weight_name = f"{args.proj_dir}/rwkv-init.pth"
+            generate_init_weight(model, init_weight_name)  # save initial weights
+            args.load_model = init_weight_name
+
+        rank_zero_info(f"########## Loading {args.load_model}... ##########")
+        try:
             load_dict = torch.load(args.load_model, map_location="cpu", weights_only=True, mmap=True)
+            load_keys = list(load_dict.keys())
+            for k in load_keys:
+                if k.startswith('_forward_module.'):
+                    load_dict[k.replace('_forward_module.','')] = load_dict[k]
+                    del load_dict[k]
+        except:
+            rank_zero_info(f"Bad checkpoint {args.load_model}")
+            if args.train_stage >= 2:  # try again using another checkpoint
+                max_p = args.my_pile_prev_p
+                if max_p == -1:
+                    args.load_model = f"{args.proj_dir}/rwkv-init.pth"
+                else:
+                    args.load_model = f"{args.proj_dir}/rwkv-{max_p}.pth"
+                args.epoch_begin = max_p + 1
+                rank_zero_info(f"Trying {args.load_model}")
+                load_dict = torch.load(args.load_model, map_location="cpu", weights_only=True, mmap=True)
 
-    if args.load_partial == 1:
-        load_keys = load_dict.keys()
-        for k in model.state_dict():
-            if k not in load_keys:
-                load_dict[k] = model.state_dict()[k]
-    model.load_state_dict(load_dict)
+        if args.load_partial == 1:
+            load_keys = load_dict.keys()
+            for k in model.state_dict():
+                if k not in load_keys:
+                    load_dict[k] = model.state_dict()[k]
+        model.load_state_dict(load_dict)
+
+    elif args.train_type == "fla":
+        import fla
+        from transformers import AutoModelForCausalLM
+        import fla
+        from transformers import AutoModelForCausalLM
+        from src.model import RWKVFLA
+        rank_zero_info(f"########## Loading FLA {args.fla_dir}... ##########")
+        model = RWKVFLA(args)
+
 
     trainer = Trainer.from_argparse_args(
         args,
@@ -256,6 +274,6 @@ if __name__ == "__main__":
     # must set shuffle=False, persistent_workers=False (because worker is in another thread)
     data_loader = DataLoader(train_data, shuffle=False, pin_memory=True, batch_size=args.micro_bsz, num_workers=1, persistent_workers=False, drop_last=True)
 
-    if trainer.global_rank == 0:
-        print(f'### Preparing for training (loaded {args.load_model}). Please wait...')
+    # if trainer.global_rank == 0:
+    #     print(f'### Preparing for training (loaded {args.load_model}). Please wait...')
     trainer.fit(model, data_loader)

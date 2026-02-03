@@ -454,3 +454,174 @@ class RWKV(pl.LightningModule):
         gc.collect()
         torch.cuda.empty_cache()
         return m
+
+
+import fla
+from transformers import AutoModelForCausalLM
+import fla
+from transformers import AutoModelForCausalLM
+
+class RWKVFLA(pl.LightningModule):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.model = AutoModelForCausalLM.from_pretrained(args.fla_dir, trust_remote_code=True)
+        self.model.train()
+
+        if args.grad_cp == 1:
+            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        # self.model = torch.compile(self.model, mode="max-autotune")
+
+    def configure_optimizers(self):
+        args = self.args
+        
+        lr_decay = set()
+        lr_1x = set()
+        lr_2x = set()
+        # model.layers.0.attn.w_lora.lora.2.bias
+        for n, p in self.model.named_parameters():
+            if ("w_lora.lora.2.bias" in n):
+                lr_2x.add(n)
+            elif (len(p.squeeze().shape) >= 2) and (args.weight_decay > 0) and (".weight" in n):
+                lr_decay.add(n)
+            else:
+                lr_1x.add(n)
+
+        lr_decay = sorted(list(lr_decay))
+        lr_1x = sorted(list(lr_1x))
+        lr_2x = sorted(list(lr_2x))
+
+        if self.trainer.is_global_zero:
+            print('decay', lr_decay, '\n')
+            print('1x', lr_1x, '\n')
+            print('2x', lr_2x, '\n')
+
+        param_dict = {n: p for n, p in self.model.named_parameters()}
+        
+        optim_groups = [
+            {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0},
+            {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "my_lr_scale": 2.0},
+        ]
+
+        if args.weight_decay > 0:
+            optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": args.weight_decay, "my_lr_scale": 1.0}]
+            if self.deepspeed_offload:
+                return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
+            return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
+        else:
+            if self.deepspeed_offload:
+                return DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=False, weight_decay=0, amsgrad=False)
+            return FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
+
+    @property
+    def deepspeed_offload(self) -> bool:
+        strategy = self.trainer.strategy
+        if isinstance(strategy, DeepSpeedStrategy):
+            cfg = strategy.config["zero_optimization"]
+            return cfg.get("offload_optimizer") or cfg.get("offload_param")
+        return False
+
+    def forward(self, idx):
+        args = self.args
+        B, T = idx.size()
+        assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
+
+        x = self.model.forward(input_ids=idx)
+        return x.logits
+
+    def training_step(self, batch, batch_idx):
+        idx, targets = batch
+        logits = self(idx)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return L2Wrap.apply(loss, logits)
+
+    def training_step_end(self, batch_parts):
+        all = self.all_gather(batch_parts)
+        if self.trainer.is_global_zero:
+            self.trainer.my_loss_all = all
+
+    def generate_init_weight(self):
+        raise NotImplementedError
+        print(
+            f"""
+############################################################################
+#
+# Init model weight (slow for large models)...
+#
+############################################################################
+"""
+        )
+        m = {}
+        n_params = 0
+        for n in self.state_dict():
+            p = self.state_dict()[n]
+            shape = p.shape
+
+            s0 = str(shape[0]) if len(shape) > 0 else ""
+            s1 = str(shape[1]) if len(shape) > 1 else ""
+            s2 = str(shape[2]) if len(shape) > 2 else ""
+            s3 = str(shape[3]) if len(shape) > 3 else ""
+            print(f"{s0.ljust(5)} {s1.ljust(5)} {s2.ljust(5)} {s3.ljust(5)} {n}", end="")
+
+            scale = 1.0
+            if "ln_" in n or ".ln" in n or "time_" in n or "_mask" in n or "pos_emb" in n or '.mask.' in n or n.endswith('_w') or n.endswith('_w1') or n.endswith('_w2') or n.endswith('_bias') or (".weight" not in n):
+                if 'ln_x.weight' in n:
+                    layer_scale = (1+int(n.split('.')[1])) / self.args.n_layer
+                    m[n] = (p * 0.0) + (layer_scale ** 0.7)
+                else:
+                    m[n] = p
+                print()
+            elif n == "emb.weight":
+                m[n] = p
+                scale = -1e-4
+                nn.init.uniform_(m[n], a=scale, b=-scale)
+                print(f" [scale {scale}]")
+            elif n == "head.weight":
+                m[n] = p
+                if self.args.vocab_size > self.args.n_embd:
+                    scale = 0.5 * math.sqrt(self.args.vocab_size / self.args.n_embd)
+                else:
+                    scale = 0.5
+                nn.init.orthogonal_(m[n], gain=scale)
+                print(f" [scale {scale}]")
+            else:
+                assert n.endswith('.weight') # should always be true
+
+                zero = [".att.output.", ".ffn.value.", ".ffn.receptance.", ".ffnPre.value.", ".ffnPre.receptance.", "head_q.", '.oo.', '.rr.']
+
+                for kk in zero:
+                    if kk in n:
+                        scale = 0
+
+                for kk in [".att.key."]:
+                    if kk in n:
+                        scale = 0.1
+                for kk in [".att.gate."]:
+                    if kk in n:
+                        scale = 0.1
+
+                print(f" [scale {scale}]")
+
+                if self.args.accelerator.upper() == "GPU":
+                    m[n] = torch.empty((shape[0], shape[1]), device="cuda")
+                else:
+                    m[n] = torch.empty((shape[0], shape[1]))
+
+                if scale == 0:
+                    nn.init.zeros_(m[n])
+                elif scale < 0:
+                    nn.init.uniform_(m[n], a=scale, b=-scale)
+                else:
+                    nn.init.orthogonal_(m[n], gain=scale)
+
+            m[n] = m[n].cpu()
+            if os.environ["RWKV_FLOAT_MODE"] == "fp16":
+                m[n] = m[n].half()
+            elif os.environ["RWKV_FLOAT_MODE"] == "bf16":
+                m[n] = m[n].bfloat16()
+            n_params += m[n].numel()
+
+        print('model params', n_params)
+        gc.collect()
+        torch.cuda.empty_cache()
+        return m

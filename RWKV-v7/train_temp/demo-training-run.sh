@@ -21,9 +21,9 @@ PROJ_DIR="out/L"$N_LAYER"-D"$N_EMBD"-"$MODEL_TYPE # set output folder
 # !!! so here we will REMOVE all previous checkpts in PROJ_DIR, so they won't be loaded !!!
 # !!! comment these if you don't want this behavior !!!
 #
-rm "$PROJ_DIR"/rwkv-*0.pth
-rm "$PROJ_DIR"/rwkv-71.pth
-rm "$PROJ_DIR"/rwkv-final.pth
+# rm "$PROJ_DIR"/rwkv-*0.pth
+# rm "$PROJ_DIR"/rwkv-71.pth
+# rm "$PROJ_DIR"/rwkv-final.pth
 #
 #######################################################################################################################
 #
@@ -33,7 +33,7 @@ rm "$PROJ_DIR"/rwkv-final.pth
 # Larger model => use smaller LR
 # Finetuning => use very small LR, such as 1e-5
 #
-M_BSZ="16" # takes ~9G VRAM here => reduce this to save VRAM, increase this for faster speed
+M_BSZ="48" # takes ~9G VRAM here => reduce this to save VRAM, increase this for faster speed
 LR_INIT="6e-4"
 LR_FINAL="6e-5"
 GRAD_CP=1 # 1 => slower, save VRAM; 0 => faster, more VRAM
